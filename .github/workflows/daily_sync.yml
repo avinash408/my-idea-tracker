@@ -1,0 +1,35 @@
+name: Sync Daily Bhavcopy & Update Parquet
+
+on:
+  schedule:
+    - cron: '0 12 * * 1-5'  # 5:30 PM IST (Mon-Fri)
+  workflow_dispatch:
+
+jobs:
+  update-dataset:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Bhavcopy ETL & Calculate Returns
+        run: |
+          python src/build_stock_day_dataset.py
+
+      - name: Commit and Push Parquet Updates
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/processed/stock_day.parquet
+          git diff --quiet && git diff --staged --quiet || git commit -m "Auto-update daily stock metrics [skip ci]"
+          git push
