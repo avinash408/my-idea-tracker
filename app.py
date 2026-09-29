@@ -11,6 +11,13 @@ def load_data():
 
 try:
     day_df, shp_df = load_data()
+    if "turnover_cr" not in day_df.columns:
+        if "turnover" in day_df.columns:
+            day_df["turnover_cr"] = pd.to_numeric(day_df["turnover"], errors="coerce") / 1e7
+        elif "close" in day_df.columns and "volume" in day_df.columns:
+            day_df["turnover_cr"] = (pd.to_numeric(day_df["close"], errors="coerce") * pd.to_numeric(day_df["volume"], errors="coerce")) / 1e7
+        else:
+            day_df["turnover_cr"] = 0.0
 except Exception as e:
     st.error(f"Error loading Parquet files: {e}")
     st.stop()
