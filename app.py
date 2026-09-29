@@ -29,6 +29,17 @@ try:
                 lambda s: s.shift(1).rolling(20, min_periods=1).mean()
             )
             day_df["rvol"] = (day_df["volume"] / day_df["vol_sma20"]).fillna(1.0)
+
+    # Standardize vol_sma_20 vs vol_sma20
+    if "vol_sma_20" not in day_df.columns:
+        if "vol_sma20" in day_df.columns:
+            day_df["vol_sma_20"] = day_df["vol_sma20"]
+        elif "volume" in day_df.columns and "isin" in day_df.columns:
+            day_df["vol_sma_20"] = day_df.groupby("isin")["volume"].transform(
+                lambda s: s.shift(1).rolling(20, min_periods=1).mean()
+            )
+        else:
+            day_df["vol_sma_20"] = 0.0
 except Exception as e:
     st.error(f"Error loading Parquet files: {e}")
     st.stop()
