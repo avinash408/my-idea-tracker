@@ -18,6 +18,17 @@ try:
             day_df["turnover_cr"] = (pd.to_numeric(day_df["close"], errors="coerce") * pd.to_numeric(day_df["volume"], errors="coerce")) / 1e7
         else:
             day_df["turnover_cr"] = 0.0
+    if "rvol" not in day_df.columns:
+        if "vol_surge_ratio" in day_df.columns:
+            day_df["rvol"] = pd.to_numeric(day_df["vol_surge_ratio"], errors="coerce").fillna(1.0)
+        elif "vol_sma20" in day_df.columns and "volume" in day_df.columns:
+            day_df["rvol"] = (pd.to_numeric(day_df["volume"], errors="coerce") / pd.to_numeric(day_df["vol_sma20"], errors="coerce")).fillna(1.0)
+        else:
+            # Fallback calculation if rolling average was not precomputed
+            day_df["vol_sma20"] = day_df.groupby("isin")["volume"].transform(
+                lambda s: s.shift(1).rolling(20, min_periods=1).mean()
+            )
+            day_df["rvol"] = (day_df["volume"] / day_df["vol_sma20"]).fillna(1.0)
 except Exception as e:
     st.error(f"Error loading Parquet files: {e}")
     st.stop()
