@@ -16,20 +16,20 @@ def load_data():
 try:
     day_df, shp_df = load_data()
 
-    # 1. Recover index if 'isin' is set as the DataFrame index
+    # 1. Recover index if 'isin' was stored as the index
     if "isin" not in day_df.columns and ("isin" in str(day_df.index.name).lower() or day_df.index.name == "isin"):
         day_df = day_df.reset_index()
     if "isin" not in shp_df.columns and ("isin" in str(shp_df.index.name).lower() or shp_df.index.name == "isin"):
         shp_df = shp_df.reset_index()
 
-    # 2. Normalize 'symbol' column if merge created suffixes (symbol_x, symbol_master, etc.)
+    # 2. Normalize 'symbol' column
     if "symbol" not in day_df.columns:
         for alt in ["symbol_x", "symbol_master", "symbol_y", "TckrSymb"]:
             if alt in day_df.columns:
                 day_df["symbol"] = day_df[alt]
                 break
 
-    # 3. Normalize 'isin' column if merge created suffixes
+    # 3. Normalize 'isin' column
     if "isin" not in day_df.columns:
         for alt in ["isin_x", "isin_master", "isin_y", "ISIN"]:
             if alt in day_df.columns:
@@ -42,7 +42,7 @@ try:
     if "quarter_dt" in shp_df.columns:
         shp_df["quarter_dt"] = pd.to_datetime(shp_df["quarter_dt"], errors="coerce")
 
-    # 5. Ensure numeric types for core trading metrics
+    # 5. Numeric conversions
     for col in ["close", "prev_close", "volume", "turnover"]:
         if col in day_df.columns:
             day_df[col] = pd.to_numeric(day_df[col], errors="coerce")
@@ -56,22 +56,29 @@ try:
         else:
             day_df["turnover_cr"] = 0.0
 
-    # 7. Safe trailing return calculations (1D, 1W, 1M)
+    # 7. Multi-horizon return calculations (1D, 3D, 4D, 1W, 1M)
     day_df = day_df.sort_values(["isin", "trade_date"])
     if "return_1d" not in day_df.columns and "close" in day_df.columns:
         day_df["return_1d"] = day_df.groupby("isin")["close"].pct_change(1) * 100
+    
+    # 3-Day and 4-Day trailing returns
+    if "return_3d" not in day_df.columns and "close" in day_df.columns:
+        day_df["return_3d"] = day_df.groupby("isin")["close"].pct_change(3) * 100
+    if "return_4d" not in day_df.columns and "close" in day_df.columns:
+        day_df["return_4d"] = day_df.groupby("isin")["close"].pct_change(4) * 100
+
     if "return_1w" not in day_df.columns and "close" in day_df.columns:
         day_df["return_1w"] = day_df.groupby("isin")["close"].pct_change(5) * 100
     if "return_1m" not in day_df.columns and "close" in day_df.columns:
         day_df["return_1m"] = day_df.groupby("isin")["close"].pct_change(21) * 100
 
-    for ret_col in ["return_1d", "return_1w", "return_1m"]:
+    for ret_col in ["return_1d", "return_3d", "return_4d", "return_1w", "return_1m"]:
         if ret_col not in day_df.columns:
             day_df[ret_col] = 0.0
         else:
             day_df[ret_col] = day_df[ret_col].fillna(0.0)
 
-    # 8. Volume baseline & RVOL calculations
+    # 8. Volume baseline & RVOL calculations (20D baseline)
     if "vol_sma_20" not in day_df.columns:
         if "vol_sma20" in day_df.columns:
             day_df["vol_sma_20"] = day_df["vol_sma20"]
@@ -95,7 +102,7 @@ except Exception as e:
     st.error(f"Error loading or initializing Parquet files: {e}")
     st.stop()
 
-st.title("📊 NSE Sector Tracker & Institutional Flow")
+st.title("📊 NSE Sector Tracker & Momentum Scanner")
 
 # Sidebar Filters
 sectors = sorted(day_df["custom_sector"].dropna().unique()) if "custom_sector" in day_df.columns else []
@@ -111,15 +118,122 @@ latest_date = target_df["trade_date"].max()
 latest_stocks = target_df[target_df["trade_date"] == latest_date].copy()
 date_str = latest_date.strftime("%d-%b-%Y") if pd.notna(latest_date) else "Latest"
 
-# Three main tabs
-tab1, tab2, tab3 = st.tabs([
+# App Navigation Tabs
+tab_surge, tab_returns, tab_vol, tab_shp = st.tabs([
+    "🔥 Momentum & Surge Sectors (3-4D)",
     "🚀 Price Returns",
-    "⚡ Volume Surge & Breakouts",
+    "⚡ Daily Volume Spikes",
     "🏛️ Institutional Stakes (FII/DII)"
 ])
 
+# ----------------- TAB 0: 3-4 DAY POSITIVE SECTORS + 2-MONTH VOLUME SURGE -----------------
+with tab_surge:
+    st.markdown(f"### 🔥 Positive Sectors with 2-Month Volume Surge ({date_str})")
+    st.caption("Filters sectors/industries with positive 3-day or 4-day cumulative returns and surging volume relative to their 2-month (~42 trading days) average.")
+
+    col_s1, col_s2, col_s3 = st.columns(3)
+    with col_s1:
+        lookback_days = st.radio("Lookback Period for Positive Momentum", [3, 4], horizontal=True,
+                                 format_func=lambda x: f"Last {x} Trading Days")
+    with col_s2:
+        min_surge_mult = st.slider("Minimum 2-Month Volume Surge", min_value=0.8, max_value=4.0, value=1.2, step=0.1,
+                                   help="1.2x means trading at 120% of its trailing 2-month average turnover")
+    with col_s3:
+        group_level = st.radio("Classification Level", ["custom_sector", "custom_industry"], horizontal=True,
+                               format_func=lambda x: "Coarse (Sector)" if x == "custom_sector" else "Granular (Industry)")
+
+    ret_col_target = f"return_{lookback_days}d"
+
+    if group_level in day_df.columns:
+        # 1. Aggregate daily turnover and average return per sector/industry
+        sec_agg = (
+            day_df.groupby(["trade_date", group_level])
+            .agg(
+                turnover_cr=("turnover_cr", "sum"),
+                avg_return=(ret_col_target, "mean"),
+                ret_1d=("return_1d", "mean"),
+                stock_count=("isin", "nunique")
+            )
+            .reset_index()
+            .sort_values([group_level, "trade_date"])
+        )
+
+        # 2. Two-month (42 trading days) baseline calculation
+        # Uses shift(1) to compare today's turnover strictly against prior baseline
+        sec_agg["turnover_2m_sma"] = (
+            sec_agg.groupby(group_level)["turnover_cr"]
+            .transform(lambda s: s.shift(1).rolling(42, min_periods=5).mean())
+        )
+        sec_agg["surge_2m_mult"] = (sec_agg["turnover_cr"] / sec_agg["turnover_2m_sma"]).round(2)
+
+        # 3. Filter for latest trading session
+        latest_sec = sec_agg[sec_agg["trade_date"] == latest_date].copy()
+
+        # 4. Conditions: Positive in last 3-4 days AND volume surge >= threshold
+        qualified_sectors = latest_sec[
+            (latest_sec["avg_return"] > 0) & 
+            (latest_sec["surge_2m_mult"] >= min_surge_mult)
+        ].sort_values("surge_2m_mult", ascending=False)
+
+        if not qualified_sectors.empty:
+            st.markdown(f"#### Identified **{len(qualified_sectors)}** Sectors with Positive {lookback_days}D Return & 2-Month Volume Accumulation")
+            st.dataframe(
+                qualified_sectors[[group_level, "avg_return", "ret_1d", "turnover_cr", "turnover_2m_sma", "surge_2m_mult", "stock_count"]]
+                .rename(columns={
+                    group_level: "Sector / Industry",
+                    "avg_return": f"Avg {lookback_days}D Return",
+                    "ret_1d": "Today's Return",
+                    "turnover_cr": "Today's Turnover (₹ Cr)",
+                    "turnover_2m_sma": "2-Month Avg Turnover (₹ Cr)",
+                    "surge_2m_mult": "2M Volume Surge Ratio",
+                    "stock_count": "Total Stocks"
+                })
+                .style.format({
+                    f"Avg {lookback_days}D Return": "{:+.2f}%",
+                    "Today's Return": "{:+.2f}%",
+                    "Today's Turnover (₹ Cr)": "₹{:.1f} Cr",
+                    "2-Month Avg Turnover (₹ Cr)": "₹{:.1f} Cr",
+                    "2M Volume Surge Ratio": "{:.2f}x",
+                    "Total Stocks": "{:.0f}"
+                }),
+                use_container_width=True
+            )
+
+            # Drill-down: Top constituent stocks in these surging sectors
+            st.markdown("#### 🎯 Leading Stocks in Surging Positive Sectors")
+            surging_names = qualified_sectors[group_level].tolist()
+            drill_stocks = latest_stocks[latest_stocks[group_level].isin(surging_names)].copy()
+            
+            # Rank stocks by 3-4 day return inside the surging sector
+            drill_stocks["rank_in_sector"] = drill_stocks.groupby(group_level)[ret_col_target].rank(ascending=False, method="dense")
+            top_constituents = drill_stocks[drill_stocks["rank_in_sector"] <= 3].sort_values([group_level, "rank_in_sector"])
+
+            st.dataframe(
+                top_constituents[[group_level, "rank_in_sector", "symbol", "company_name", "close", ret_col_target, "return_1d", "turnover_cr", "rvol"]]
+                .rename(columns={
+                    group_level: "Sector / Industry",
+                    "rank_in_sector": "Rank",
+                    ret_col_target: f"{lookback_days}D Return",
+                    "return_1d": "1D Return",
+                    "turnover_cr": "Turnover (₹ Cr)",
+                    "rvol": "Daily RVOL"
+                })
+                .style.format({
+                    "close": "₹{:.2f}",
+                    f"{lookback_days}D Return": "{:+.2f}%",
+                    "1D Return": "{:+.2f}%",
+                    "Turnover (₹ Cr)": "₹{:.2f} Cr",
+                    "Daily RVOL": "{:.2f}x"
+                }),
+                use_container_width=True
+            )
+        else:
+            st.info(f"No sectors met both criteria: Positive {lookback_days}-day return (> 0%) and 2-Month volume surge ≥ {min_surge_mult}x. Try adjusting the surge slider.")
+    else:
+        st.warning(f"Classification column '{group_level}' not found in dataset.")
+
 # ----------------- TAB 1: RETURNS -----------------
-with tab1:
+with tab_returns:
     col_m1, col_m2, col_m3 = st.columns(3)
     col_m1.metric("Daily Avg Return", f"{target_df['return_1d'].mean():.2f}%")
     col_m2.metric("Weekly Avg Return", f"{target_df['return_1w'].mean():.2f}%")
@@ -128,9 +242,12 @@ with tab1:
     st.markdown(f"#### Top 3 Gainers by Industry ({date_str})")
     timeframe = st.radio(
         "Select Return Horizon", 
-        ["return_1d", "return_1w", "return_1m"], 
+        ["return_1d", "return_3d", "return_4d", "return_1w", "return_1m"], 
         horizontal=True,
-        format_func=lambda x: {"return_1d": "Daily", "return_1w": "Weekly", "return_1m": "Monthly"}.get(x, x)
+        format_func=lambda x: {
+            "return_1d": "1 Day", "return_3d": "3 Days", "return_4d": "4 Days", 
+            "return_1w": "1 Week (5D)", "return_1m": "1 Month (21D)"
+        }.get(x, x)
     )
 
     if "custom_industry" in latest_stocks.columns:
@@ -149,8 +266,8 @@ with tab1:
         st.dataframe(top_3[avail_cols].style.format(fmt_dict), use_container_width=True)
 
 # ----------------- TAB 2: VOLUME SPIKES -----------------
-with tab2:
-    st.markdown(f"### ⚡ Volume Spikes & Unusual Activity ({date_str})")
+with tab_vol:
+    st.markdown(f"### ⚡ Daily Volume Spikes & Unusual Activity ({date_str})")
 
     col_v1, col_v2 = st.columns([1, 2])
     with col_v1:
@@ -171,7 +288,7 @@ with tab2:
 
         latest_ind = ind_turnover[ind_turnover["trade_date"] == latest_date].sort_values("industry_rvol", ascending=False).dropna(subset=["industry_rvol"])
 
-        st.markdown("#### 🏭 Industries with Largest Turnover Surge")
+        st.markdown("#### 🏭 Industries with Largest Daily Turnover Surge")
         if not latest_ind.empty:
             st.dataframe(
                 latest_ind[["custom_industry", "turnover_cr", "ind_turnover_sma20", "industry_rvol"]]
@@ -224,7 +341,7 @@ with tab2:
         st.info(f"No stocks found with RVOL ≥ {min_rvol}x and Turnover ≥ ₹{min_turnover} Cr today.")
 
 # ----------------- TAB 3: SHAREHOLDING -----------------
-with tab3:
+with tab_shp:
     st.markdown("### Institutional Stake Changes (QoQ)")
     
     if shp_df.empty or "quarter_dt" not in shp_df.columns:
@@ -245,7 +362,6 @@ with tab3:
             avail_meta_cols = [c for c in ["isin", "custom_sector", "custom_industry", "symbol"] if c in day_df.columns]
             master_meta = day_df[avail_meta_cols].drop_duplicates("isin")
 
-        # Drop any overlapping non-key columns before merging to prevent _x/_y suffix collision
         for overlap_col in ["custom_sector", "custom_industry", "symbol"]:
             if overlap_col in quarter_shp.columns and overlap_col in master_meta.columns:
                 quarter_shp = quarter_shp.drop(columns=[overlap_col])
@@ -276,4 +392,4 @@ with tab3:
 
             st.dataframe(top_stake[avail_shp_cols].style.format(active_shp_fmt), use_container_width=True)
         else:
-            st.warning("Stake change delta columns (FIIs_delta, DIIs_delta, Promoters_delta) not found in shareholding dataset.")
+            st.warning("Stake change delta columns not found in shareholding dataset.")
