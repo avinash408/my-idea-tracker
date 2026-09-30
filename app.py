@@ -1,8 +1,11 @@
+from pathlib import Path
 import streamlit as st
 import pandas as pd
 import numpy as np
 
 st.set_page_config(page_title="NSE Sector & Stake Tracker", layout="wide")
+
+MASTER_PATH = Path("data/master/stock_master_final.csv")
 
 @st.cache_data(ttl="1h")
 def load_data():
@@ -12,19 +15,39 @@ def load_data():
 
 try:
     day_df, shp_df = load_data()
-    
-    # 1. Date normalization
-    if "trade_date" in day_df.columns:
-        day_df["trade_date"] = pd.to_datetime(day_df["trade_date"])
-    if "quarter_dt" in shp_df.columns:
-        shp_df["quarter_dt"] = pd.to_datetime(shp_df["quarter_dt"])
 
-    # 2. Ensure numeric types for essential price & volume columns
+    # 1. Recover index if 'isin' is set as the DataFrame index
+    if "isin" not in day_df.columns and ("isin" in str(day_df.index.name).lower() or day_df.index.name == "isin"):
+        day_df = day_df.reset_index()
+    if "isin" not in shp_df.columns and ("isin" in str(shp_df.index.name).lower() or shp_df.index.name == "isin"):
+        shp_df = shp_df.reset_index()
+
+    # 2. Normalize 'symbol' column if merge created suffixes (symbol_x, symbol_master, etc.)
+    if "symbol" not in day_df.columns:
+        for alt in ["symbol_x", "symbol_master", "symbol_y", "TckrSymb"]:
+            if alt in day_df.columns:
+                day_df["symbol"] = day_df[alt]
+                break
+
+    # 3. Normalize 'isin' column if merge created suffixes
+    if "isin" not in day_df.columns:
+        for alt in ["isin_x", "isin_master", "isin_y", "ISIN"]:
+            if alt in day_df.columns:
+                day_df["isin"] = day_df[alt]
+                break
+
+    # 4. Standardize dates
+    if "trade_date" in day_df.columns:
+        day_df["trade_date"] = pd.to_datetime(day_df["trade_date"], errors="coerce")
+    if "quarter_dt" in shp_df.columns:
+        shp_df["quarter_dt"] = pd.to_datetime(shp_df["quarter_dt"], errors="coerce")
+
+    # 5. Ensure numeric types for core trading metrics
     for col in ["close", "prev_close", "volume", "turnover"]:
         if col in day_df.columns:
             day_df[col] = pd.to_numeric(day_df[col], errors="coerce")
 
-    # 3. Turnover standardization (in ₹ Crores: 1 Cr = 1e7 INR)
+    # 6. Turnover standardization (in ₹ Crores: 1 Cr = 1e7 INR)
     if "turnover_cr" not in day_df.columns:
         if "turnover" in day_df.columns:
             day_df["turnover_cr"] = day_df["turnover"] / 1e7
@@ -33,7 +56,7 @@ try:
         else:
             day_df["turnover_cr"] = 0.0
 
-    # 4. Return horizons (1D, 1W, 1M) fallback check
+    # 7. Safe trailing return calculations (1D, 1W, 1M)
     day_df = day_df.sort_values(["isin", "trade_date"])
     if "return_1d" not in day_df.columns and "close" in day_df.columns:
         day_df["return_1d"] = day_df.groupby("isin")["close"].pct_change(1) * 100
@@ -42,14 +65,13 @@ try:
     if "return_1m" not in day_df.columns and "close" in day_df.columns:
         day_df["return_1m"] = day_df.groupby("isin")["close"].pct_change(21) * 100
 
-    # Fill any remaining NaNs in return columns
     for ret_col in ["return_1d", "return_1w", "return_1m"]:
         if ret_col not in day_df.columns:
             day_df[ret_col] = 0.0
         else:
             day_df[ret_col] = day_df[ret_col].fillna(0.0)
 
-    # 5. Volume baseline (vol_sma_20 & vol_sma20 aliases)
+    # 8. Volume baseline & RVOL calculations
     if "vol_sma_20" not in day_df.columns:
         if "vol_sma20" in day_df.columns:
             day_df["vol_sma_20"] = day_df["vol_sma20"]
@@ -61,7 +83,6 @@ try:
             day_df["vol_sma_20"] = 0.0
     day_df["vol_sma20"] = day_df["vol_sma_20"]
 
-    # 6. Relative Volume (RVOL)
     if "rvol" not in day_df.columns:
         if "vol_surge_ratio" in day_df.columns:
             day_df["rvol"] = pd.to_numeric(day_df["vol_surge_ratio"], errors="coerce").fillna(1.0)
@@ -71,17 +92,17 @@ try:
             day_df["rvol"] = 1.0
 
 except Exception as e:
-    st.error(f"Error loading or processing Parquet files: {e}")
+    st.error(f"Error loading or initializing Parquet files: {e}")
     st.stop()
 
 st.title("📊 NSE Sector Tracker & Institutional Flow")
 
 # Sidebar Filters
-sectors = sorted(day_df["custom_sector"].dropna().unique())
+sectors = sorted(day_df["custom_sector"].dropna().unique()) if "custom_sector" in day_df.columns else []
 selected_sector = st.sidebar.selectbox("Filter Sector", ["All"] + sectors)
 
 sub_df = day_df if selected_sector == "All" else day_df[day_df["custom_sector"] == selected_sector]
-industries = sorted(sub_df["custom_industry"].dropna().unique())
+industries = sorted(sub_df["custom_industry"].dropna().unique()) if "custom_industry" in sub_df.columns else []
 selected_industry = st.sidebar.selectbox("Filter Industry", ["All"] + industries)
 
 target_df = sub_df if selected_industry == "All" else sub_df[sub_df["custom_industry"] == selected_industry]
@@ -112,23 +133,20 @@ with tab1:
         format_func=lambda x: {"return_1d": "Daily", "return_1w": "Weekly", "return_1m": "Monthly"}.get(x, x)
     )
 
-    latest_stocks["rank"] = latest_stocks.groupby("custom_industry")[timeframe].rank(ascending=False, method="dense")
-    top_3 = latest_stocks[latest_stocks["rank"] <= 3].sort_values(["custom_industry", "rank"]).copy()
+    if "custom_industry" in latest_stocks.columns:
+        latest_stocks["rank"] = latest_stocks.groupby("custom_industry")[timeframe].rank(ascending=False, method="dense")
+        top_3 = latest_stocks[latest_stocks["rank"] <= 3].sort_values(["custom_industry", "rank"]).copy()
 
-    # Safely select available columns
-    desired_cols = ["custom_industry", "rank", "symbol", "company_name", "close", timeframe]
-    avail_cols = [c for c in desired_cols if c in top_3.columns]
+        desired_cols = ["custom_industry", "rank", "symbol", "company_name", "close", timeframe]
+        avail_cols = [c for c in desired_cols if c in top_3.columns]
 
-    fmt_dict = {}
-    if "close" in avail_cols:
-        fmt_dict["close"] = "₹{:.2f}"
-    if timeframe in avail_cols:
-        fmt_dict[timeframe] = "{:+.2f}%"
+        fmt_dict = {}
+        if "close" in avail_cols:
+            fmt_dict["close"] = "₹{:.2f}"
+        if timeframe in avail_cols:
+            fmt_dict[timeframe] = "{:+.2f}%"
 
-    st.dataframe(
-        top_3[avail_cols].style.format(fmt_dict),
-        use_container_width=True
-    )
+        st.dataframe(top_3[avail_cols].style.format(fmt_dict), use_container_width=True)
 
 # ----------------- TAB 2: VOLUME SPIKES -----------------
 with tab2:
@@ -139,46 +157,45 @@ with tab2:
         min_rvol = st.slider("Minimum Relative Volume (RVOL)", min_value=1.5, max_value=10.0, value=2.0, step=0.5,
                              help="2.0x means double the 20-day average volume")
         min_turnover = st.number_input("Min Turnover (₹ Cr)", min_value=0.0, value=1.0, step=0.5,
-                                      help="Filters out illiquid micro-caps")
+                                       help="Filters out illiquid micro-caps")
 
-    # 1. Industry Aggregate Turnover Spike
-    ind_turnover = day_df.groupby(["trade_date", "custom_industry"])["turnover_cr"].sum().reset_index()
-    ind_turnover = ind_turnover.sort_values(["custom_industry", "trade_date"])
-    
-    # Safe rolling turnover calculation using transform
-    ind_turnover["ind_turnover_sma20"] = (
-        ind_turnover.groupby("custom_industry")["turnover_cr"]
-        .transform(lambda s: s.shift(1).rolling(20, min_periods=3).mean())
-    )
-    ind_turnover["industry_rvol"] = (ind_turnover["turnover_cr"] / ind_turnover["ind_turnover_sma20"]).round(2)
-
-    latest_ind = ind_turnover[ind_turnover["trade_date"] == latest_date].sort_values("industry_rvol", ascending=False).dropna(subset=["industry_rvol"])
-
-    st.markdown("#### 🏭 Industries with Largest Turnover Surge")
-    if not latest_ind.empty:
-        st.dataframe(
-            latest_ind[["custom_industry", "turnover_cr", "ind_turnover_sma20", "industry_rvol"]]
-            .rename(columns={
-                "turnover_cr": "Turnover Today (₹ Cr)", 
-                "ind_turnover_sma20": "20D Avg Turnover (₹ Cr)", 
-                "industry_rvol": "Volume Surge Multiple (RVOL)"
-            })
-            .head(10)
-            .style.format({
-                "Turnover Today (₹ Cr)": "₹{:.1f} Cr", 
-                "20D Avg Turnover (₹ Cr)": "₹{:.1f} Cr", 
-                "Volume Surge Multiple (RVOL)": "{:.2f}x"
-            }),
-            use_container_width=True
+    # 1. Industry Aggregate Turnover Surge
+    if "custom_industry" in day_df.columns:
+        ind_turnover = day_df.groupby(["trade_date", "custom_industry"])["turnover_cr"].sum().reset_index()
+        ind_turnover = ind_turnover.sort_values(["custom_industry", "trade_date"])
+        ind_turnover["ind_turnover_sma20"] = (
+            ind_turnover.groupby("custom_industry")["turnover_cr"]
+            .transform(lambda s: s.shift(1).rolling(20, min_periods=3).mean())
         )
-    else:
-        st.info("Insufficient historical days to compute 20-day industry turnover baselines.")
+        ind_turnover["industry_rvol"] = (ind_turnover["turnover_cr"] / ind_turnover["ind_turnover_sma20"]).round(2)
+
+        latest_ind = ind_turnover[ind_turnover["trade_date"] == latest_date].sort_values("industry_rvol", ascending=False).dropna(subset=["industry_rvol"])
+
+        st.markdown("#### 🏭 Industries with Largest Turnover Surge")
+        if not latest_ind.empty:
+            st.dataframe(
+                latest_ind[["custom_industry", "turnover_cr", "ind_turnover_sma20", "industry_rvol"]]
+                .rename(columns={
+                    "turnover_cr": "Turnover Today (₹ Cr)", 
+                    "ind_turnover_sma20": "20D Avg Turnover (₹ Cr)", 
+                    "industry_rvol": "Volume Surge Multiple (RVOL)"
+                })
+                .head(10)
+                .style.format({
+                    "Turnover Today (₹ Cr)": "₹{:.1f} Cr", 
+                    "20D Avg Turnover (₹ Cr)": "₹{:.1f} Cr", 
+                    "Volume Surge Multiple (RVOL)": "{:.2f}x"
+                }),
+                use_container_width=True
+            )
+        else:
+            st.info("Insufficient historical sessions to compute 20-day industry turnover baselines.")
 
     # 2. Stock Level Volume Spike Leaderboard
     st.markdown("#### 🚀 Stocks with Large Volume Spikes")
     spike_stocks = latest_stocks[(latest_stocks["rvol"] >= min_rvol) & (latest_stocks["turnover_cr"] >= min_turnover)].copy()
 
-    if not spike_stocks.empty:
+    if not spike_stocks.empty and "custom_industry" in spike_stocks.columns:
         spike_stocks["vol_rank"] = spike_stocks.groupby("custom_industry")["rvol"].rank(ascending=False, method="dense")
         spike_stocks = spike_stocks.sort_values(["rvol"], ascending=False)
 
@@ -219,18 +236,30 @@ with tab3:
 
         quarter_shp = shp_df[shp_df["quarter_dt"] == latest_quarter].copy()
 
-        # Merge classification metadata from day_df
-        master_meta = day_df[["isin", "custom_sector", "custom_industry", "symbol"]].drop_duplicates("isin")
+        # Build clean metadata directly from master CSV (priority) or day_df (fallback)
+        if MASTER_PATH.exists():
+            master_raw = pd.read_csv(MASTER_PATH, dtype=str)
+            target_meta_cols = [c for c in ["isin", "custom_sector", "custom_industry", "symbol"] if c in master_raw.columns]
+            master_meta = master_raw[target_meta_cols].drop_duplicates("isin")
+        else:
+            avail_meta_cols = [c for c in ["isin", "custom_sector", "custom_industry", "symbol"] if c in day_df.columns]
+            master_meta = day_df[avail_meta_cols].drop_duplicates("isin")
+
+        # Drop any overlapping non-key columns before merging to prevent _x/_y suffix collision
+        for overlap_col in ["custom_sector", "custom_industry", "symbol"]:
+            if overlap_col in quarter_shp.columns and overlap_col in master_meta.columns:
+                quarter_shp = quarter_shp.drop(columns=[overlap_col])
+
         quarter_shp = quarter_shp.merge(master_meta, on="isin", how="inner")
 
-        if selected_sector != "All":
+        if selected_sector != "All" and "custom_sector" in quarter_shp.columns:
             quarter_shp = quarter_shp[quarter_shp["custom_sector"] == selected_sector]
-        if selected_industry != "All":
+        if selected_industry != "All" and "custom_industry" in quarter_shp.columns:
             quarter_shp = quarter_shp[quarter_shp["custom_industry"] == selected_industry]
 
         avail_metrics = [m for m in ["FIIs_delta", "DIIs_delta", "Promoters_delta"] if m in quarter_shp.columns]
         
-        if avail_metrics:
+        if avail_metrics and "custom_industry" in quarter_shp.columns:
             stake_metric = st.selectbox("Rank By Stake Change", avail_metrics)
             quarter_shp["stake_rank"] = quarter_shp.groupby("custom_industry")[stake_metric].rank(ascending=False, method="dense")
             top_stake = quarter_shp[quarter_shp["stake_rank"] <= 3].sort_values(["custom_industry", "stake_rank"]).copy()
@@ -245,9 +274,6 @@ with tab3:
             }
             active_shp_fmt = {k: v for k, v in shp_fmt.items() if k in avail_shp_cols}
 
-            st.dataframe(
-                top_stake[avail_shp_cols].style.format(active_shp_fmt),
-                use_container_width=True
-            )
+            st.dataframe(top_stake[avail_shp_cols].style.format(active_shp_fmt), use_container_width=True)
         else:
-            st.warning("Delta columns (FIIs_delta, DIIs_delta, Promoters_delta) not found in shareholding dataset.")
+            st.warning("Stake change delta columns (FIIs_delta, DIIs_delta, Promoters_delta) not found in shareholding dataset.")
