@@ -4,7 +4,7 @@ on:
   schedule:
     # 9:00 PM IST (Mon-Fri) = 15:30 UTC
     - cron: '30 15 * * 1-5'
-  workflow_dispatch: # Allows you to manually trigger it anytime from GitHub
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -15,6 +15,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Required for clean rebasing
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -28,7 +30,6 @@ jobs:
 
       - name: 1. Download Today's Bhavcopy from NSE
         run: |
-          # Fetch trailing 5 days to ensure no missing holidays or weekends
           python src/download_daily_market_data.py --days 5
 
       - name: 2. Process Bhavcopy & Build Parquet Dataset
@@ -41,10 +42,11 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add data/raw/market_data/ data/processed/stock_day.parquet
           
-          # Only commit if data files actually changed
           if git diff --staged --quiet; then
             echo "No new market data found to commit."
           else
             git commit -m "Auto-sync daily NSE market data [skip ci]"
+            # Pull down any recent commits on remote and rebase local commit on top
+            git pull --rebase origin main
             git push origin main
           fi
