@@ -16,7 +16,8 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Required for clean rebasing
+          ref: main
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -36,17 +37,9 @@ jobs:
         run: |
           python src/build_stock_day_dataset.py
 
-      - name: 3. Commit and Push Updated Parquet to Main
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/raw/market_data/ data/processed/stock_day.parquet
-          
-          if git diff --staged --quiet; then
-            echo "No new market data found to commit."
-          else
-            git commit -m "Auto-sync daily NSE market data [skip ci]"
-            # Pull down any recent commits on remote and rebase local commit on top
-            git pull --rebase origin main
-            git push origin main
-          fi
+      - name: 3. Commit and Push Changes
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Auto-sync daily NSE market data [skip ci]"
+          file_pattern: "data/raw/market_data/*.csv data/processed/stock_day.parquet"
+          branch: main
