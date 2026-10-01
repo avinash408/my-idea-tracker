@@ -1,15 +1,19 @@
-name: Sync Daily Bhavcopy & Update Parquet
+name: Daily Bhavcopy Ingestion & App Refresh
 
 on:
   schedule:
-    - cron: '0 12 * * 1-5'  # 5:30 PM IST (Mon-Fri)
-  workflow_dispatch:
+    # 9:00 PM IST (Mon-Fri) = 15:30 UTC
+    - cron: '30 15 * * 1-5'
+  workflow_dispatch: # Allows you to manually trigger it anytime from GitHub
+
+permissions:
+  contents: write
 
 jobs:
-  update-dataset:
+  sync-data:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repo
+      - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -20,16 +24,27 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
+          pip install pandas pyarrow requests beautifulsoup4
 
-      - name: Run Bhavcopy ETL & Calculate Returns
+      - name: 1. Download Today's Bhavcopy from NSE
+        run: |
+          # Fetch trailing 5 days to ensure no missing holidays or weekends
+          python src/download_daily_market_data.py --days 5
+
+      - name: 2. Process Bhavcopy & Build Parquet Dataset
         run: |
           python src/build_stock_day_dataset.py
 
-      - name: Commit and Push Parquet Updates
+      - name: 3. Commit and Push Updated Parquet to Main
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/processed/stock_day.parquet
-          git diff --quiet && git diff --staged --quiet || git commit -m "Auto-update daily stock metrics [skip ci]"
-          git push
+          git add data/raw/market_data/ data/processed/stock_day.parquet
+          
+          # Only commit if data files actually changed
+          if git diff --staged --quiet; then
+            echo "No new market data found to commit."
+          else
+            git commit -m "Auto-sync daily NSE market data [skip ci]"
+            git push origin main
+          fi
