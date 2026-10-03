@@ -119,7 +119,7 @@ latest_stocks = target_df[target_df["trade_date"] == latest_date].copy()
 date_str = latest_date.strftime("%d-%b-%Y") if pd.notna(latest_date) else "Latest"
 
 # App Navigation Tabs
-tab_surge, tab_returns, tab_vol, tab_shp = st.tabs([
+tab_surge, tab_backtest, tab_returns, tab_vol, tab_shp = st.tabs([
     "🔥 Momentum & Surge Sectors (3-4D)",
     "🧪 Backtest Engine",
     "🚀 Price Returns",
