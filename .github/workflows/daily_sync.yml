@@ -3,7 +3,7 @@ name: Daily Bhavcopy Ingestion & App Refresh
 on:
   schedule:
     # 9:00 PM IST (Mon-Fri) = 15:30 UTC
-    - cron: '30 15 * * 1-5'
+    - cron: '20 13 * * 1-5'
   workflow_dispatch:
 
 permissions:
