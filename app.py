@@ -1,53 +1,59 @@
+import os
 from pathlib import Path
 import streamlit as st
 import pandas as pd
 import numpy as np
 
-st.set_page_config(page_title="NSE Sector & Stake Tracker", layout="wide")
+st.set_page_config(page_title="NSE Sector & Breakout Tracker", layout="wide")
 
 MASTER_PATH = Path("data/master/stock_master_final.csv")
+STOCK_PARQUET = Path("data/processed/stock_day.parquet")
+SHP_PARQUET = Path("data/processed/shareholding.parquet")
 
-@st.cache_data(ttl="1h")
-def load_data():
-    day_df = pd.read_parquet("data/processed/stock_day.parquet")
-    shp_df = pd.read_parquet("data/processed/shareholding.parquet")
+
+def get_file_mtime(path: Path) -> float:
+    return os.path.getmtime(path) if path.exists() else 0.0
+
+
+@st.cache_data
+def load_data(stock_mtime: float, shp_mtime: float):
+    day_df = pd.read_parquet(STOCK_PARQUET)
+    shp_df = pd.read_parquet(SHP_PARQUET) if SHP_PARQUET.exists() else pd.DataFrame()
     return day_df, shp_df
 
-try:
-    day_df, shp_df = load_data()
 
-    # 1. Recover index if 'isin' was stored as the index
+try:
+    day_df, shp_df = load_data(get_file_mtime(STOCK_PARQUET), get_file_mtime(SHP_PARQUET))
+
+    # 1. Recover index if 'isin' was stored as index
     if "isin" not in day_df.columns and ("isin" in str(day_df.index.name).lower() or day_df.index.name == "isin"):
         day_df = day_df.reset_index()
-    if "isin" not in shp_df.columns and ("isin" in str(shp_df.index.name).lower() or shp_df.index.name == "isin"):
+    if not shp_df.empty and "isin" not in shp_df.columns and ("isin" in str(shp_df.index.name).lower() or shp_df.index.name == "isin"):
         shp_df = shp_df.reset_index()
 
-    # 2. Normalize 'symbol' column
+    # 2. Normalize 'symbol' and 'isin'
     if "symbol" not in day_df.columns:
         for alt in ["symbol_x", "symbol_master", "symbol_y", "TckrSymb"]:
             if alt in day_df.columns:
                 day_df["symbol"] = day_df[alt]
                 break
 
-    # 3. Normalize 'isin' column
     if "isin" not in day_df.columns:
         for alt in ["isin_x", "isin_master", "isin_y", "ISIN"]:
             if alt in day_df.columns:
                 day_df["isin"] = day_df[alt]
                 break
 
-    # 4. Standardize dates
-    if "trade_date" in day_df.columns:
-        day_df["trade_date"] = pd.to_datetime(day_df["trade_date"], errors="coerce")
-    if "quarter_dt" in shp_df.columns:
+    # 3. Standardize dates & numeric columns
+    day_df["trade_date"] = pd.to_datetime(day_df["trade_date"], errors="coerce")
+    if not shp_df.empty and "quarter_dt" in shp_df.columns:
         shp_df["quarter_dt"] = pd.to_datetime(shp_df["quarter_dt"], errors="coerce")
 
-    # 5. Numeric conversions
-    for col in ["close", "prev_close", "volume", "turnover"]:
+    for col in ["open", "high", "low", "close", "prev_close", "volume", "turnover"]:
         if col in day_df.columns:
             day_df[col] = pd.to_numeric(day_df[col], errors="coerce")
 
-    # 6. Turnover standardization (in ₹ Crores: 1 Cr = 1e7 INR)
+    # 4. Turnover in ₹ Crores
     if "turnover_cr" not in day_df.columns:
         if "turnover" in day_df.columns:
             day_df["turnover_cr"] = day_df["turnover"] / 1e7
@@ -56,53 +62,54 @@ try:
         else:
             day_df["turnover_cr"] = 0.0
 
-    # 7. Multi-horizon return calculations (1D, 3D, 4D, 1W, 1M)
-    day_df = day_df.sort_values(["isin", "trade_date"])
-    if "return_1d" not in day_df.columns and "close" in day_df.columns:
-        day_df["return_1d"] = day_df.groupby("isin")["close"].pct_change(1) * 100
-    
-    # 3-Day and 4-Day trailing returns
-    if "return_3d" not in day_df.columns and "close" in day_df.columns:
-        day_df["return_3d"] = day_df.groupby("isin")["close"].pct_change(3) * 100
-    if "return_4d" not in day_df.columns and "close" in day_df.columns:
-        day_df["return_4d"] = day_df.groupby("isin")["close"].pct_change(4) * 100
+    # 5. Sort & Compute Multi-Horizon Returns + Breakout Technicals
+    day_df = day_df.sort_values(["isin", "trade_date"]).reset_index(drop=True)
+    grp = day_df.groupby("isin")
 
-    if "return_1w" not in day_df.columns and "close" in day_df.columns:
-        day_df["return_1w"] = day_df.groupby("isin")["close"].pct_change(5) * 100
-    if "return_1m" not in day_df.columns and "close" in day_df.columns:
-        day_df["return_1m"] = day_df.groupby("isin")["close"].pct_change(21) * 100
+    if "return_1d" not in day_df.columns:
+        day_df["return_1d"] = grp["close"].pct_change(1) * 100
+    if "return_3d" not in day_df.columns:
+        day_df["return_3d"] = grp["close"].pct_change(3) * 100
+    if "return_4d" not in day_df.columns:
+        day_df["return_4d"] = grp["close"].pct_change(4) * 100
+    if "return_1w" not in day_df.columns:
+        day_df["return_1w"] = grp["close"].pct_change(5) * 100
+    if "return_1m" not in day_df.columns:
+        day_df["return_1m"] = grp["close"].pct_change(21) * 100
 
     for ret_col in ["return_1d", "return_3d", "return_4d", "return_1w", "return_1m"]:
-        if ret_col not in day_df.columns:
-            day_df[ret_col] = 0.0
-        else:
-            day_df[ret_col] = day_df[ret_col].fillna(0.0)
+        day_df[ret_col] = day_df[ret_col].fillna(0.0)
 
-    # 8. Volume baseline & RVOL calculations (20D baseline)
-    if "vol_sma_20" not in day_df.columns:
-        if "vol_sma20" in day_df.columns:
-            day_df["vol_sma_20"] = day_df["vol_sma20"]
-        elif "volume" in day_df.columns:
-            day_df["vol_sma_20"] = day_df.groupby("isin")["volume"].transform(
-                lambda s: s.shift(1).rolling(20, min_periods=1).mean()
-            )
-        else:
-            day_df["vol_sma_20"] = 0.0
+    # 6. Volume Baselines (20D & 42D / 2-Month) + 3-Day Sustained Accumulation
+    day_df["vol_sma_20"] = grp["volume"].transform(lambda s: s.shift(1).rolling(20, min_periods=3).mean())
     day_df["vol_sma20"] = day_df["vol_sma_20"]
+    day_df["vol_sma_42"] = grp["volume"].transform(lambda s: s.shift(1).rolling(42, min_periods=5).mean())
+    day_df["vol_3d_avg"] = grp["volume"].transform(lambda s: s.rolling(3, min_periods=1).mean())
 
-    if "rvol" not in day_df.columns:
-        if "vol_surge_ratio" in day_df.columns:
-            day_df["rvol"] = pd.to_numeric(day_df["vol_surge_ratio"], errors="coerce").fillna(1.0)
-        elif "volume" in day_df.columns:
-            day_df["rvol"] = (day_df["volume"] / day_df["vol_sma_20"].replace(0, np.nan)).fillna(1.0)
-        else:
-            day_df["rvol"] = 1.0
+    day_df["rvol"] = (day_df["volume"] / day_df["vol_sma_20"].replace(0, np.nan)).fillna(1.0)
+    day_df["sustained_vol_ratio"] = (day_df["vol_3d_avg"] / day_df["vol_sma_42"].replace(0, np.nan)).fillna(1.0)
+
+    # 7. Early Breakout Indicators (Prior 20D & 50D Resistance Highs + Close Range Strength)
+    if "high" in day_df.columns and "low" in day_df.columns:
+        day_df["prior_high_20d"] = grp["high"].transform(lambda s: s.shift(1).rolling(20, min_periods=5).max())
+        day_df["prior_high_50d"] = grp["high"].transform(lambda s: s.shift(1).rolling(50, min_periods=10).max())
+        day_df["is_20d_bo"] = day_df["close"] > day_df["prior_high_20d"]
+        day_df["is_50d_bo"] = day_df["close"] > day_df["prior_high_50d"]
+
+        candle_range = (day_df["high"] - day_df["low"]).replace(0, np.nan)
+        day_df["close_strength"] = ((day_df["close"] - day_df["low"]) / candle_range).fillna(0.5)
+    else:
+        day_df["prior_high_20d"] = grp["close"].transform(lambda s: s.shift(1).rolling(20, min_periods=5).max())
+        day_df["prior_high_50d"] = grp["close"].transform(lambda s: s.shift(1).rolling(50, min_periods=10).max())
+        day_df["is_20d_bo"] = day_df["close"] > day_df["prior_high_20d"]
+        day_df["is_50d_bo"] = day_df["close"] > day_df["prior_high_50d"]
+        day_df["close_strength"] = 1.0
 
 except Exception as e:
     st.error(f"Error loading or initializing Parquet files: {e}")
     st.stop()
 
-st.title("📊 NSE Sector Tracker & Momentum Scanner")
+st.title("📊 NSE Sector & Day-1 Breakout Scanner")
 
 # Sidebar Filters
 sectors = sorted(day_df["custom_sector"].dropna().unique()) if "custom_sector" in day_df.columns else []
@@ -118,8 +125,9 @@ latest_date = target_df["trade_date"].max()
 latest_stocks = target_df[target_df["trade_date"] == latest_date].copy()
 date_str = latest_date.strftime("%d-%b-%Y") if pd.notna(latest_date) else "Latest"
 
-# App Navigation Tabs
-tab_surge, tab_backtest, tab_returns, tab_vol, tab_shp = st.tabs([
+# Navigation Tabs
+tab_bo, tab_surge, tab_backtest, tab_returns, tab_vol, tab_shp = st.tabs([
+    "🎯 Day-1 Breakouts & Money Flow",
     "🔥 Momentum & Surge Sectors (3-4D)",
     "🧪 Backtest Engine",
     "🚀 Price Returns",
@@ -127,7 +135,143 @@ tab_surge, tab_backtest, tab_returns, tab_vol, tab_shp = st.tabs([
     "🏛️ Institutional Stakes (FII/DII)"
 ])
 
-# ----------------- TAB 0: 3-4 DAY POSITIVE SECTORS + 2-MONTH VOLUME SURGE -----------------
+# ----------------- TAB 0: DAY-1 BREAKOUTS & EARLY MONEY FLOW -----------------
+with tab_bo:
+    st.markdown(f"### 🎯 Day-1 Institutional Breakouts & Early Sector Thrust ({date_str})")
+    st.caption(
+        "Catches money-moving breakouts on Day 1: stocks clearing 20D/50D resistance highs, closing near the top of their range, "
+        "and backed by single-day RVOL or 3-day sustained volume accumulation—independent of lagging sector averages."
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        bo_horizon = st.radio("Resistance Breakout", ["20D High", "50D High"], horizontal=True)
+    with c2:
+        bo_min_turnover = st.number_input("Min Turnover (₹ Cr)", min_value=0.5, value=5.0, step=1.0, key="bo_turn",
+                                          help="Filters out illiquid penny stocks (₹5 Cr+ recommended)")
+    with c3:
+        bo_min_vol = st.slider("Min Volume Expansion", min_value=1.0, max_value=4.0, value=1.4, step=0.1, key="bo_vol",
+                               help="Triggers if either Daily RVOL OR 3D Sustained Volume vs 2M Avg exceeds this threshold")
+    with c4:
+        bo_min_strength = st.slider("Min Close Strength", min_value=0.50, max_value=0.95, value=0.70, step=0.05,
+                                    help="0.70 = Price closed in the top 30% of today's High-Low range")
+
+    bo_flag_col = "is_20d_bo" if bo_horizon == "20D High" else "is_50d_bo"
+    ref_high_col = "prior_high_20d" if bo_horizon == "20D High" else "prior_high_50d"
+
+    # Evaluate Breakout Condition across ALL stocks on latest_date (respecting sidebar filter if set)
+    bo_candidates = latest_stocks[
+        (latest_stocks[bo_flag_col]) &
+        (latest_stocks["turnover_cr"] >= bo_min_turnover) &
+        (latest_stocks["close_strength"] >= bo_min_strength) &
+        ((latest_stocks["rvol"] >= bo_min_vol) | (latest_stocks["sustained_vol_ratio"] >= bo_min_vol))
+    ].copy()
+
+    bo_candidates["pct_above_res"] = ((bo_candidates["close"] - bo_candidates[ref_high_col]) / bo_candidates[ref_high_col]) * 100
+    # Composite Money-Flow Score combining volume surge, sustained accumulation, and closing conviction
+    bo_candidates["flow_score"] = (
+        (bo_candidates[["rvol", "sustained_vol_ratio"]].max(axis=1) * 40) +
+        (bo_candidates["close_strength"] * 30) +
+        (np.log1p(bo_candidates["turnover_cr"]) * 10)
+    ).round(1)
+
+    bo_candidates = bo_candidates.sort_values("flow_score", ascending=False)
+
+    # Top Summary Metrics
+    m_bo1, m_bo2, m_bo3 = st.columns(3)
+    m_bo1.metric("Day-1 Breakout Stocks", f"{len(bo_candidates)}")
+    m_bo2.metric("Total Breakout Turnover", f"₹{bo_candidates['turnover_cr'].sum():,.1f} Cr")
+    top_sec_name = bo_candidates["custom_industry"].value_counts().index[0] if not bo_candidates.empty and "custom_industry" in bo_candidates.columns else "—"
+    m_bo3.metric("Most Active Industry Today", top_sec_name)
+
+    st.markdown("#### 🚀 Day-1 Breakout Leaderboard (Includes New Listings & Standalone Leaders)")
+    if not bo_candidates.empty:
+        bo_cols = [
+            "symbol", "company_name", "custom_industry", "close", "return_1d",
+            "pct_above_res", "rvol", "sustained_vol_ratio", "close_strength", "turnover_cr", "flow_score"
+        ]
+        avail_bo_cols = [c for c in bo_cols if c in bo_candidates.columns]
+
+        st.dataframe(
+            bo_candidates[avail_bo_cols]
+            .rename(columns={
+                "symbol": "Symbol",
+                "company_name": "Company",
+                "custom_industry": "Industry",
+                "close": "Close",
+                "return_1d": "1D Return",
+                "pct_above_res": f"% > {bo_horizon}",
+                "rvol": "1D RVOL",
+                "sustained_vol_ratio": "3D Accum vs 2M",
+                "close_strength": "Range Close %",
+                "turnover_cr": "Turnover (₹ Cr)",
+                "flow_score": "Flow Score",
+            })
+            .style.format({
+                "Close": "₹{:.2f}",
+                "1D Return": "{:+.2f}%",
+                f"% > {bo_horizon}": "{:+.2f}%",
+                "1D RVOL": "{:.2f}x",
+                "3D Accum vs 2M": "{:.2f}x",
+                "Range Close %": "{:.0%}",
+                "Turnover (₹ Cr)": "₹{:.2f} Cr",
+                "Flow Score": "{:.1f}",
+            }),
+            use_container_width=True
+        )
+    else:
+        st.info("No stocks matched the strict Day-1 breakout criteria today. Try lowering Min Turnover or Min Volume Expansion.")
+
+    # Section B: Early Sector Breadth Thrust (Catches Banks/Sectors on Day 1)
+    st.markdown("#### 🌊 Early Sector Breadth Thrust (Sectors Breaking Out Together Today)")
+    st.caption("Detects sectors where multiple liquid constituents simultaneously break out or surge in volume today—before 3-4 day averages turn.")
+
+    all_today = day_df[(day_df["trade_date"] == latest_date) & (day_df["turnover_cr"] >= 2.0)].copy()
+    if not all_today.empty and "custom_industry" in all_today.columns:
+        all_today["is_active_thrust"] = (
+            (all_today["return_1d"] > 1.0) &
+            ((all_today["rvol"] >= 1.3) | (all_today["sustained_vol_ratio"] >= 1.3) | (all_today["is_20d_bo"]))
+        )
+        breadth_df = (
+            all_today.groupby("custom_industry")
+            .agg(
+                liquid_stocks=("isin", "nunique"),
+                thrust_stocks=("is_active_thrust", "sum"),
+                breakout_20d=("is_20d_bo", "sum"),
+                avg_1d_ret=("return_1d", "mean"),
+                total_turnover=("turnover_cr", "sum"),
+            )
+            .reset_index()
+        )
+        breadth_df = breadth_df[breadth_df["liquid_stocks"] >= 3].copy()
+        breadth_df["breadth_pct"] = (breadth_df["thrust_stocks"] / breadth_df["liquid_stocks"]) * 100
+        breadth_df = breadth_df[breadth_df["thrust_stocks"] >= 2].sort_values(
+            ["breadth_pct", "breakout_20d", "total_turnover"], ascending=False
+        )
+
+        if not breadth_df.empty:
+            st.dataframe(
+                breadth_df.head(15)
+                .rename(columns={
+                    "custom_industry": "Industry",
+                    "liquid_stocks": "Liquid Stocks",
+                    "thrust_stocks": "Stocks in Thrust",
+                    "breadth_pct": "Breadth Thrust %",
+                    "breakout_20d": "20D High Breakouts",
+                    "avg_1d_ret": "Avg 1D Return",
+                    "total_turnover": "Industry Turnover (₹ Cr)",
+                })
+                .style.format({
+                    "Breadth Thrust %": "{:.1f}%",
+                    "Avg 1D Return": "{:+.2f}%",
+                    "Industry Turnover (₹ Cr)": "₹{:.1f} Cr",
+                }),
+                use_container_width=True
+            )
+        else:
+            st.info("No broad multi-stock industry thrust detected today.")
+
+# ----------------- TAB 1: 3-4 DAY POSITIVE SECTORS + 2-MONTH VOLUME SURGE -----------------
 with tab_surge:
     st.markdown(f"### 🔥 Positive Sectors with 2-Month Volume Surge ({date_str})")
     st.caption("Filters sectors/industries with positive 3-day or 4-day cumulative returns and surging volume relative to their 2-month (~42 trading days) average.")
@@ -146,7 +290,6 @@ with tab_surge:
     ret_col_target = f"return_{lookback_days}d"
 
     if group_level in day_df.columns:
-        # 1. Aggregate daily turnover and average return per sector/industry
         sec_agg = (
             day_df.groupby(["trade_date", group_level])
             .agg(
@@ -159,20 +302,15 @@ with tab_surge:
             .sort_values([group_level, "trade_date"])
         )
 
-        # 2. Two-month (42 trading days) baseline calculation
-        # Uses shift(1) to compare today's turnover strictly against prior baseline
         sec_agg["turnover_2m_sma"] = (
             sec_agg.groupby(group_level)["turnover_cr"]
             .transform(lambda s: s.shift(1).rolling(42, min_periods=5).mean())
         )
         sec_agg["surge_2m_mult"] = (sec_agg["turnover_cr"] / sec_agg["turnover_2m_sma"]).round(2)
 
-        # 3. Filter for latest trading session
         latest_sec = sec_agg[sec_agg["trade_date"] == latest_date].copy()
-
-        # 4. Conditions: Positive in last 3-4 days AND volume surge >= threshold
         qualified_sectors = latest_sec[
-            (latest_sec["avg_return"] > 0) & 
+            (latest_sec["avg_return"] > 0) &
             (latest_sec["surge_2m_mult"] >= min_surge_mult)
         ].sort_values("surge_2m_mult", ascending=False)
 
@@ -200,12 +338,9 @@ with tab_surge:
                 use_container_width=True
             )
 
-            # Drill-down: Top constituent stocks in these surging sectors
             st.markdown("#### 🎯 Leading Stocks in Surging Positive Sectors")
             surging_names = qualified_sectors[group_level].tolist()
             drill_stocks = latest_stocks[latest_stocks[group_level].isin(surging_names)].copy()
-            
-            # Rank stocks by 3-4 day return inside the surging sector
             drill_stocks["rank_in_sector"] = drill_stocks.groupby(group_level)[ret_col_target].rank(ascending=False, method="dense")
             top_constituents = drill_stocks[drill_stocks["rank_in_sector"] <= 3].sort_values([group_level, "rank_in_sector"])
 
@@ -229,173 +364,257 @@ with tab_surge:
                 use_container_width=True
             )
         else:
-            st.info(f"No sectors met both criteria: Positive {lookback_days}-day return (> 0%) and 2-Month volume surge ≥ {min_surge_mult}x. Try adjusting the surge slider.")
-    else:
-        st.warning(f"Classification column '{group_level}' not found in dataset.")
+            st.info(f"No sectors met both criteria: Positive {lookback_days}-day return (> 0%) and 2-Month volume surge ≥ {min_surge_mult}x.")
 
-# ----------------- TAB 1: BACKTEST ENGINE -----------------
+# ----------------- TAB 2: BACKTEST ENGINE -----------------
 with tab_backtest:
-    st.markdown("### 🧪 Backtest: 3-4D Momentum + 2-Month Volume Surge")
-    st.caption("Evaluate how sectors performed after meeting the positive return and 2-month volume surge conditions on historical dates.")
+    st.markdown("### 🧪 Strategy Backtest Engine")
+    
+    bt_strategy = st.radio(
+        "Select Strategy to Backtest",
+        ["Day-1 Stock Breakouts (Money Flow)", "Positive Sectors + 2M Volume Surge (3-4D)"],
+        horizontal=True
+    )
 
-    # 1. Date Range & Parameter Controls
     all_dates = sorted(day_df["trade_date"].dropna().unique())
-    if len(all_dates) < 50:
-        st.warning("At least ~50 trading days of historical data are recommended to run backtests with 2-month (42-day) volume baselines.")
-
     min_available_date = all_dates[0].date()
     max_available_date = all_dates[-1].date()
 
-    col_b1, col_b2, col_b3, col_b4 = st.columns(4)
-    with col_b1:
-        bt_from = st.date_input("From Date", value=min_available_date, min_value=min_available_date, max_value=max_available_date)
-    with col_b2:
-        bt_till = st.date_input("Till Date", value=max_available_date, min_value=min_available_date, max_value=max_available_date)
-    with col_b3:
-        bt_lookback = st.radio("Lookback Days", [3, 4], horizontal=True, key="bt_lookback", format_func=lambda x: f"{x} Days")
-    with col_b4:
-        bt_surge_min = st.slider("Min 2M Surge Ratio", min_value=1.0, max_value=3.0, value=1.2, step=0.1, key="bt_surge")
+    # ================= STRATEGY A: DAY-1 STOCK BREAKOUTS =================
+    if bt_strategy == "Day-1 Stock Breakouts (Money Flow)":
+        st.caption("Simulates buying stocks on the close of Day-1 resistance breakouts backed by volume accumulation and strong range closes.")
 
-    col_b5, col_b6 = st.columns(2)
-    with col_b5:
-        bt_group = st.radio("Classification Level", ["custom_sector", "custom_industry"], horizontal=True, key="bt_group",
-                            format_func=lambda x: "Sector" if x == "custom_sector" else "Industry")
-    with col_b6:
-        bt_fwd_horizon = st.selectbox("Benchmark Forward Horizon for Win Rate", ["fwd_return_5d", "fwd_return_10d", "fwd_return_20d"],
-                                      format_func=lambda x: {"fwd_return_5d": "+5 Days", "fwd_return_10d": "+10 Days", "fwd_return_20d": "+20 Days (1 Month)"}[x])
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            bt_from = st.date_input("From Date", value=min_available_date, min_value=min_available_date, max_value=max_available_date, key="bo_bt_from")
+        with c2:
+            bt_till = st.date_input("Till Date", value=max_available_date, min_value=min_available_date, max_value=max_available_date, key="bo_bt_till")
+        with c3:
+            bt_bo_horizon = st.radio("Breakout Level", ["20D High", "50D High"], horizontal=True, key="bo_bt_hor")
+        with c4:
+            bt_hold_days = st.selectbox("Holding Period", [5, 10, 20], index=1, format_func=lambda x: f"{x} Trading Days")
 
-    if bt_from > bt_till:
-        st.error("Error: 'From Date' must be earlier than 'Till Date'.")
-    else:
-        ret_target_col = f"return_{bt_lookback}d"
+        c5, c6, c7 = st.columns(3)
+        with c5:
+            bt_bo_turn = st.number_input("Min Turnover (₹ Cr)", min_value=0.5, value=5.0, step=1.0, key="bo_bt_turn")
+        with c6:
+            bt_bo_vol = st.slider("Min Volume Expansion", min_value=1.0, max_value=4.0, value=1.4, step=0.1, key="bo_bt_vol")
+        with c7:
+            bt_bo_str = st.slider("Min Close Strength", min_value=0.50, max_value=0.95, value=0.70, step=0.05, key="bo_bt_str")
 
-        # 2. Build Full Historical Sector Aggregate Timeline
-        sec_hist = (
-            day_df.groupby(["trade_date", bt_group])
-            .agg(
-                turnover_cr=("turnover_cr", "sum"),
-                sector_return_1d=("return_1d", "mean"),
-                lookback_ret=(ret_target_col, "mean")
-            )
-            .reset_index()
-            .sort_values([bt_group, "trade_date"])
-        )
-
-        # 3. Two-Month (42 trading days) Baseline without lookahead bias
-        sec_hist["turnover_2m_sma"] = (
-            sec_hist.groupby(bt_group)["turnover_cr"]
-            .transform(lambda s: s.shift(1).rolling(42, min_periods=5).mean())
-        )
-        sec_hist["surge_2m_mult"] = (sec_hist["turnover_cr"] / sec_hist["turnover_2m_sma"]).round(2)
-
-        # 4. Calculate Forward Returns (+5D, +10D, +20D) to measure performance after the signal
-        # Compounding daily returns into forward multi-day cumulative returns
-        sec_hist["daily_growth"] = 1.0 + (sec_hist["sector_return_1d"] / 100.0)
-
-        # Shift(-N) looks forward in time to track post-signal returns
-        sec_hist["fwd_return_5d"] = (
-            sec_hist.groupby(bt_group)["daily_growth"]
-            .transform(lambda s: s.shift(-5).rolling(5, min_periods=5).apply(np.prod, raw=True) - 1.0) * 100.0
-        )
-        sec_hist["fwd_return_10d"] = (
-            sec_hist.groupby(bt_group)["daily_growth"]
-            .transform(lambda s: s.shift(-10).rolling(10, min_periods=10).apply(np.prod, raw=True) - 1.0) * 100.0
-        )
-        sec_hist["fwd_return_20d"] = (
-            sec_hist.groupby(bt_group)["daily_growth"]
-            .transform(lambda s: s.shift(-20).rolling(20, min_periods=20).apply(np.prod, raw=True) - 1.0) * 100.0
-        )
-
-        # 5. Filter for Trigger Conditions inside User's Selected Date Range
-        in_range_mask = (sec_hist["trade_date"].dt.date >= bt_from) & (sec_hist["trade_date"].dt.date <= bt_till)
-        trigger_mask = (
-            in_range_mask & 
-            (sec_hist["lookback_ret"] > 0) & 
-            (sec_hist["surge_2m_mult"] >= bt_surge_min)
-        )
-        signals_df = sec_hist[trigger_mask].copy().sort_values("trade_date", ascending=False)
-
-        # 6. Render Metrics & Results
-        if signals_df.empty:
-            st.info("No sectors met both positive return and 2-month volume surge conditions during this date window.")
+        if bt_from > bt_till:
+            st.error("'From Date' must be earlier than 'Till Date'.")
         else:
-            valid_fwd = signals_df.dropna(subset=[bt_fwd_horizon])
-            total_signals = len(signals_df)
-            matured_signals = len(valid_fwd)
+            bt_df = target_df.sort_values(["isin", "trade_date"]).copy()
+            grp_bt = bt_df.groupby("isin")
 
-            if matured_signals > 0:
-                win_count = (valid_fwd[bt_fwd_horizon] > 0).sum()
-                win_rate = (win_count / matured_signals) * 100.0
-                avg_fwd_ret = valid_fwd[bt_fwd_horizon].mean()
-                best_ret = valid_fwd[bt_fwd_horizon].max()
-            else:
-                win_rate, avg_fwd_ret, best_ret = 0.0, 0.0, 0.0
-
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Signals Triggered", f"{total_signals}")
-            m2.metric(f"Win Rate ({bt_fwd_horizon.replace('fwd_return_', '+').upper()})", f"{win_rate:.1f}%", f"{win_count}/{matured_signals} wins" if matured_signals > 0 else "N/A")
-            m3.metric("Avg Forward Return", f"{avg_fwd_ret:+.2f}%")
-            m4.metric("Best Forward Return", f"{best_ret:+.2f}%")
-
-            st.markdown("#### 📋 Historical Signal Log & Forward Outcomes")
+            # Compute forward returns and peak max gain over next 20 days
+            bt_df["fwd_5d"] = (grp_bt["close"].shift(-5) / bt_df["close"] - 1.0) * 100.0
+            bt_df["fwd_10d"] = (grp_bt["close"].shift(-10) / bt_df["close"] - 1.0) * 100.0
+            bt_df["fwd_20d"] = (grp_bt["close"].shift(-20) / bt_df["close"] - 1.0) * 100.0
             
-            signals_df["trigger_date"] = signals_df["trade_date"].dt.strftime("%Y-%m-%d")
-            display_cols = [
-                "trigger_date", bt_group, "lookback_ret", "turnover_cr", 
-                "surge_2m_mult", "fwd_return_5d", "fwd_return_10d", "fwd_return_20d"
-            ]
+            # Max peak gain within next 20 sessions using high price
+            high_col = "high" if "high" in bt_df.columns else "close"
+            bt_df["max_20d_high"] = grp_bt[high_col].transform(lambda s: s.shift(-20).rolling(20, min_periods=1).max())
+            bt_df["peak_gain_20d"] = ((bt_df["max_20d_high"] / bt_df["close"]) - 1.0) * 100.0
 
-            st.dataframe(
-                signals_df[display_cols]
-                .rename(columns={
-                    "trigger_date": "Signal Date",
-                    bt_group: "Sector / Industry",
-                    "lookback_ret": f"{bt_lookback}D Trailing Ret",
-                    "turnover_cr": "Turnover (₹ Cr)",
-                    "surge_2m_mult": "2M Surge Multiple",
-                    "fwd_return_5d": "Next +5D Ret",
-                    "fwd_return_10d": "Next +10D Ret",
-                    "fwd_return_20d": "Next +20D Ret"
-                })
-                .style.format({
-                    f"{bt_lookback}D Trailing Ret": "{:+.2f}%",
-                    "Turnover (₹ Cr)": "₹{:.1f} Cr",
-                    "2M Surge Multiple": "{:.2f}x",
-                    "Next +5D Ret": "{:+.2f}%",
-                    "Next +10D Ret": "{:+.2f}%",
-                    "Next +20D Ret": "{:+.2f}%"
-                }, na_rep="Ongoing"),
-                use_container_width=True
-            )
+            bo_col = "is_20d_bo" if bt_bo_horizon == "20D High" else "is_50d_bo"
+            date_mask = (bt_df["trade_date"].dt.date >= bt_from) & (bt_df["trade_date"].dt.date <= bt_till)
 
-            # 7. Sector Performance Aggregation
-            st.markdown("#### 🏆 Performance Breakdown by Sector / Industry")
-            sector_perf = (
-                valid_fwd.groupby(bt_group)
+            triggers = bt_df[
+                date_mask &
+                (bt_df[bo_col]) &
+                (bt_df["turnover_cr"] >= bt_bo_turn) &
+                (bt_df["close_strength"] >= bt_bo_str) &
+                ((bt_df["rvol"] >= bt_bo_vol) | (bt_df["sustained_vol_ratio"] >= bt_bo_vol))
+            ].copy().sort_values("trade_date", ascending=False)
+
+            target_ret_col = f"fwd_{bt_hold_days}d"
+
+            if triggers.empty:
+                st.info("No historical breakout triggers matched these parameters in the selected window.")
+            else:
+                matured = triggers.dropna(subset=[target_ret_col])
+                total_trades = len(triggers)
+                matured_count = len(matured)
+
+                if matured_count > 0:
+                    wins = matured[matured[target_ret_col] > 0]
+                    losses = matured[matured[target_ret_col] <= 0]
+                    win_rate = (len(wins) / matured_count) * 100.0
+                    avg_ret = matured[target_ret_col].mean()
+                    avg_peak = matured["peak_gain_20d"].mean()
+                    gross_win = wins[target_ret_col].sum()
+                    gross_loss = abs(losses[target_ret_col].sum())
+                    profit_factor = (gross_win / gross_loss) if gross_loss > 0 else np.inf
+                else:
+                    win_rate, avg_ret, avg_peak, profit_factor = 0.0, 0.0, 0.0, 0.0
+
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("Breakout Signals", f"{total_trades}")
+                m2.metric(f"Win Rate (+{bt_hold_days}D)", f"{win_rate:.1f}%")
+                m3.metric(f"Avg Return (+{bt_hold_days}D)", f"{avg_ret:+.2f}%")
+                m4.metric("Avg 20D Peak Gain", f"{avg_peak:+.2f}%")
+                m5.metric("Profit Factor", f"{profit_factor:.2f}" if np.isfinite(profit_factor) else "∞")
+
+                # Equity Curve of Equal-Weighted Basket per Trigger Date
+                if matured_count > 0:
+                    daily_curve = (
+                        matured.groupby("trade_date")[target_ret_col]
+                        .mean()
+                        .reset_index()
+                        .sort_values("trade_date")
+                    )
+                    daily_curve["Cumulative Return (%)"] = ((1 + daily_curve[target_ret_col] / 100.0).cumprod() - 1) * 100
+                    st.markdown(f"#### 📈 Cumulative Strategy Curve (+{bt_hold_days}D Holding Cohorts)")
+                    st.line_chart(daily_curve.set_index("trade_date")["Cumulative Return (%)"])
+
+                st.markdown("#### 📋 Historical Breakout Trade Log")
+                triggers["Signal Date"] = triggers["trade_date"].dt.strftime("%Y-%m-%d")
+                log_cols = [
+                    "Signal Date", "symbol", "custom_industry", "close", "turnover_cr",
+                    "rvol", "sustained_vol_ratio", "fwd_5d", "fwd_10d", "fwd_20d", "peak_gain_20d"
+                ]
+                avail_log_cols = [c for c in log_cols if c in triggers.columns]
+
+                st.dataframe(
+                    triggers[avail_log_cols]
+                    .rename(columns={
+                        "symbol": "Symbol",
+                        "custom_industry": "Industry",
+                        "close": "Entry Price",
+                        "turnover_cr": "Turnover (₹ Cr)",
+                        "rvol": "1D RVOL",
+                        "sustained_vol_ratio": "3D Accum",
+                        "fwd_5d": "+5D Ret",
+                        "fwd_10d": "+10D Ret",
+                        "fwd_20d": "+20D Ret",
+                        "peak_gain_20d": "Max 20D Peak",
+                    })
+                    .style.format({
+                        "Entry Price": "₹{:.2f}",
+                        "Turnover (₹ Cr)": "₹{:.1f} Cr",
+                        "1D RVOL": "{:.2f}x",
+                        "3D Accum": "{:.2f}x",
+                        "+5D Ret": "{:+.2f}%",
+                        "+10D Ret": "{:+.2f}%",
+                        "+20D Ret": "{:+.2f}%",
+                        "Max 20D Peak": "{:+.2f}%",
+                    }, na_rep="Open"),
+                    use_container_width=True
+                )
+
+    # ================= STRATEGY B: SECTOR MOMENTUM (3-4D) =================
+    else:
+        st.caption("Evaluate how sectors performed after meeting positive 3-4 day return and 2-month volume surge conditions.")
+
+        col_b1, col_b2, col_b3, col_b4 = st.columns(4)
+        with col_b1:
+            bt_from = st.date_input("From Date", value=min_available_date, min_value=min_available_date, max_value=max_available_date, key="sec_bt_from")
+        with col_b2:
+            bt_till = st.date_input("Till Date", value=max_available_date, min_value=min_available_date, max_value=max_available_date, key="sec_bt_till")
+        with col_b3:
+            bt_lookback = st.radio("Lookback Days", [3, 4], horizontal=True, key="bt_lookback", format_func=lambda x: f"{x} Days")
+        with col_b4:
+            bt_surge_min = st.slider("Min 2M Surge Ratio", min_value=1.0, max_value=3.0, value=1.2, step=0.1, key="bt_surge")
+
+        col_b5, col_b6 = st.columns(2)
+        with col_b5:
+            bt_group = st.radio("Classification Level", ["custom_sector", "custom_industry"], horizontal=True, key="bt_group",
+                                format_func=lambda x: "Sector" if x == "custom_sector" else "Industry")
+        with col_b6:
+            bt_fwd_horizon = st.selectbox("Benchmark Forward Horizon", ["fwd_return_5d", "fwd_return_10d", "fwd_return_20d"],
+                                          format_func=lambda x: {"fwd_return_5d": "+5 Days", "fwd_return_10d": "+10 Days", "fwd_return_20d": "+20 Days (1 Month)"}[x])
+
+        if bt_from > bt_till:
+            st.error("Error: 'From Date' must be earlier than 'Till Date'.")
+        else:
+            ret_target_col = f"return_{bt_lookback}d"
+            sec_hist = (
+                day_df.groupby(["trade_date", bt_group])
                 .agg(
-                    signals=("trade_date", "count"),
-                    avg_fwd_gain=(bt_fwd_horizon, "mean"),
-                    win_pct=(bt_fwd_horizon, lambda s: (s > 0).mean() * 100.0)
+                    turnover_cr=("turnover_cr", "sum"),
+                    sector_return_1d=("return_1d", "mean"),
+                    lookback_ret=(ret_target_col, "mean")
                 )
                 .reset_index()
-                .sort_values("avg_fwd_gain", ascending=False)
+                .sort_values([bt_group, "trade_date"])
             )
 
-            st.dataframe(
-                sector_perf.rename(columns={
-                    bt_group: "Sector / Industry",
-                    "signals": "Total Signals",
-                    "avg_fwd_gain": f"Avg Forward Gain ({bt_fwd_horizon.replace('fwd_return_', '+').upper()})",
-                    "win_pct": "Win Rate (%)"
-                })
-                .style.format({
-                    f"Avg Forward Gain ({bt_fwd_horizon.replace('fwd_return_', '+').upper()})": "{:+.2f}%",
-                    "Win Rate (%)": "{:.1f}%"
-                }),
-                use_container_width=True
+            sec_hist["turnover_2m_sma"] = (
+                sec_hist.groupby(bt_group)["turnover_cr"]
+                .transform(lambda s: s.shift(1).rolling(42, min_periods=5).mean())
+            )
+            sec_hist["surge_2m_mult"] = (sec_hist["turnover_cr"] / sec_hist["turnover_2m_sma"]).round(2)
+            sec_hist["daily_growth"] = 1.0 + (sec_hist["sector_return_1d"] / 100.0)
+
+            sec_hist["fwd_return_5d"] = (
+                sec_hist.groupby(bt_group)["daily_growth"]
+                .transform(lambda s: s.shift(-5).rolling(5, min_periods=5).apply(np.prod, raw=True) - 1.0) * 100.0
+            )
+            sec_hist["fwd_return_10d"] = (
+                sec_hist.groupby(bt_group)["daily_growth"]
+                .transform(lambda s: s.shift(-10).rolling(10, min_periods=10).apply(np.prod, raw=True) - 1.0) * 100.0
+            )
+            sec_hist["fwd_return_20d"] = (
+                sec_hist.groupby(bt_group)["daily_growth"]
+                .transform(lambda s: s.shift(-20).rolling(20, min_periods=20).apply(np.prod, raw=True) - 1.0) * 100.0
             )
 
-# ----------------- TAB 2: RETURNS -----------------
+            in_range_mask = (sec_hist["trade_date"].dt.date >= bt_from) & (sec_hist["trade_date"].dt.date <= bt_till)
+            trigger_mask = in_range_mask & (sec_hist["lookback_ret"] > 0) & (sec_hist["surge_2m_mult"] >= bt_surge_min)
+            signals_df = sec_hist[trigger_mask].copy().sort_values("trade_date", ascending=False)
+
+            if signals_df.empty:
+                st.info("No sectors met both positive return and 2-month volume surge conditions during this date window.")
+            else:
+                valid_fwd = signals_df.dropna(subset=[bt_fwd_horizon])
+                total_signals = len(signals_df)
+                matured_signals = len(valid_fwd)
+
+                if matured_signals > 0:
+                    win_count = (valid_fwd[bt_fwd_horizon] > 0).sum()
+                    win_rate = (win_count / matured_signals) * 100.0
+                    avg_fwd_ret = valid_fwd[bt_fwd_horizon].mean()
+                    best_ret = valid_fwd[bt_fwd_horizon].max()
+                else:
+                    win_count, win_rate, avg_fwd_ret, best_ret = 0, 0.0, 0.0, 0.0
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Signals Triggered", f"{total_signals}")
+                m2.metric(f"Win Rate ({bt_fwd_horizon.replace('fwd_return_', '+').upper()})", f"{win_rate:.1f}%", f"{win_count}/{matured_signals} wins" if matured_signals > 0 else "N/A")
+                m3.metric("Avg Forward Return", f"{avg_fwd_ret:+.2f}%")
+                m4.metric("Best Forward Return", f"{best_ret:+.2f}%")
+
+                signals_df["trigger_date"] = signals_df["trade_date"].dt.strftime("%Y-%m-%d")
+                display_cols = [
+                    "trigger_date", bt_group, "lookback_ret", "turnover_cr",
+                    "surge_2m_mult", "fwd_return_5d", "fwd_return_10d", "fwd_return_20d"
+                ]
+
+                st.dataframe(
+                    signals_df[display_cols]
+                    .rename(columns={
+                        "trigger_date": "Signal Date",
+                        bt_group: "Sector / Industry",
+                        "lookback_ret": f"{bt_lookback}D Trailing Ret",
+                        "turnover_cr": "Turnover (₹ Cr)",
+                        "surge_2m_mult": "2M Surge Multiple",
+                        "fwd_return_5d": "Next +5D Ret",
+                        "fwd_return_10d": "Next +10D Ret",
+                        "fwd_return_20d": "Next +20D Ret"
+                    })
+                    .style.format({
+                        f"{bt_lookback}D Trailing Ret": "{:+.2f}%",
+                        "Turnover (₹ Cr)": "₹{:.1f} Cr",
+                        "2M Surge Multiple": "{:.2f}x",
+                        "Next +5D Ret": "{:+.2f}%",
+                        "Next +10D Ret": "{:+.2f}%",
+                        "Next +20D Ret": "{:+.2f}%"
+                    }, na_rep="Ongoing"),
+                    use_container_width=True
+                )
+# ----------------- TAB 3: RETURNS -----------------
 with tab_returns:
     col_m1, col_m2, col_m3 = st.columns(3)
     col_m1.metric("Daily Avg Return", f"{target_df['return_1d'].mean():.2f}%")
@@ -404,11 +623,11 @@ with tab_returns:
 
     st.markdown(f"#### Top 3 Gainers by Industry ({date_str})")
     timeframe = st.radio(
-        "Select Return Horizon", 
-        ["return_1d", "return_3d", "return_4d", "return_1w", "return_1m"], 
+        "Select Return Horizon",
+        ["return_1d", "return_3d", "return_4d", "return_1w", "return_1m"],
         horizontal=True,
         format_func=lambda x: {
-            "return_1d": "1 Day", "return_3d": "3 Days", "return_4d": "4 Days", 
+            "return_1d": "1 Day", "return_3d": "3 Days", "return_4d": "4 Days",
             "return_1w": "1 Week (5D)", "return_1m": "1 Month (21D)"
         }.get(x, x)
     )
@@ -428,57 +647,19 @@ with tab_returns:
 
         st.dataframe(top_3[avail_cols].style.format(fmt_dict), use_container_width=True)
 
-# ----------------- TAB 3: VOLUME SPIKES -----------------
+# ----------------- TAB 4: VOLUME SPIKES -----------------
 with tab_vol:
     st.markdown(f"### ⚡ Daily Volume Spikes & Unusual Activity ({date_str})")
 
     col_v1, col_v2 = st.columns([1, 2])
     with col_v1:
-        min_rvol = st.slider("Minimum Relative Volume (RVOL)", min_value=1.5, max_value=10.0, value=2.0, step=0.5,
-                             help="2.0x means double the 20-day average volume")
-        min_turnover = st.number_input("Min Turnover (₹ Cr)", min_value=0.0, value=1.0, step=0.5,
-                                       help="Filters out illiquid micro-caps")
+        min_rvol = st.slider("Minimum Relative Volume (RVOL)", min_value=1.5, max_value=10.0, value=2.0, step=0.5)
+        min_turnover = st.number_input("Min Turnover (₹ Cr)", min_value=0.0, value=1.0, step=0.5)
 
-    # 1. Industry Aggregate Turnover Surge
-    if "custom_industry" in day_df.columns:
-        ind_turnover = day_df.groupby(["trade_date", "custom_industry"])["turnover_cr"].sum().reset_index()
-        ind_turnover = ind_turnover.sort_values(["custom_industry", "trade_date"])
-        ind_turnover["ind_turnover_sma20"] = (
-            ind_turnover.groupby("custom_industry")["turnover_cr"]
-            .transform(lambda s: s.shift(1).rolling(20, min_periods=3).mean())
-        )
-        ind_turnover["industry_rvol"] = (ind_turnover["turnover_cr"] / ind_turnover["ind_turnover_sma20"]).round(2)
-
-        latest_ind = ind_turnover[ind_turnover["trade_date"] == latest_date].sort_values("industry_rvol", ascending=False).dropna(subset=["industry_rvol"])
-
-        st.markdown("#### 🏭 Industries with Largest Daily Turnover Surge")
-        if not latest_ind.empty:
-            st.dataframe(
-                latest_ind[["custom_industry", "turnover_cr", "ind_turnover_sma20", "industry_rvol"]]
-                .rename(columns={
-                    "turnover_cr": "Turnover Today (₹ Cr)", 
-                    "ind_turnover_sma20": "20D Avg Turnover (₹ Cr)", 
-                    "industry_rvol": "Volume Surge Multiple (RVOL)"
-                })
-                .head(10)
-                .style.format({
-                    "Turnover Today (₹ Cr)": "₹{:.1f} Cr", 
-                    "20D Avg Turnover (₹ Cr)": "₹{:.1f} Cr", 
-                    "Volume Surge Multiple (RVOL)": "{:.2f}x"
-                }),
-                use_container_width=True
-            )
-        else:
-            st.info("Insufficient historical sessions to compute 20-day industry turnover baselines.")
-
-    # 2. Stock Level Volume Spike Leaderboard
-    st.markdown("#### 🚀 Stocks with Large Volume Spikes")
     spike_stocks = latest_stocks[(latest_stocks["rvol"] >= min_rvol) & (latest_stocks["turnover_cr"] >= min_turnover)].copy()
 
-    if not spike_stocks.empty and "custom_industry" in spike_stocks.columns:
-        spike_stocks["vol_rank"] = spike_stocks.groupby("custom_industry")["rvol"].rank(ascending=False, method="dense")
+    if not spike_stocks.empty:
         spike_stocks = spike_stocks.sort_values(["rvol"], ascending=False)
-
         cols_stock_view = ["custom_industry", "symbol", "company_name", "close", "return_1d", "volume", "vol_sma_20", "rvol", "turnover_cr"]
         avail_stock_cols = [c for c in cols_stock_view if c in spike_stocks.columns]
 
@@ -503,10 +684,10 @@ with tab_vol:
     else:
         st.info(f"No stocks found with RVOL ≥ {min_rvol}x and Turnover ≥ ₹{min_turnover} Cr today.")
 
-# ----------------- TAB 4: SHAREHOLDING -----------------
+# ----------------- TAB 5: SHAREHOLDING -----------------
 with tab_shp:
     st.markdown("### Institutional Stake Changes (QoQ)")
-    
+
     if shp_df.empty or "quarter_dt" not in shp_df.columns:
         st.info("Quarterly shareholding dataset is currently empty or updating.")
     else:
@@ -516,7 +697,6 @@ with tab_shp:
 
         quarter_shp = shp_df[shp_df["quarter_dt"] == latest_quarter].copy()
 
-        # Build clean metadata directly from master CSV (priority) or day_df (fallback)
         if MASTER_PATH.exists():
             master_raw = pd.read_csv(MASTER_PATH, dtype=str)
             target_meta_cols = [c for c in ["isin", "custom_sector", "custom_industry", "symbol"] if c in master_raw.columns]
@@ -537,7 +717,7 @@ with tab_shp:
             quarter_shp = quarter_shp[quarter_shp["custom_industry"] == selected_industry]
 
         avail_metrics = [m for m in ["FIIs_delta", "DIIs_delta", "Promoters_delta"] if m in quarter_shp.columns]
-        
+
         if avail_metrics and "custom_industry" in quarter_shp.columns:
             stake_metric = st.selectbox("Rank By Stake Change", avail_metrics)
             quarter_shp["stake_rank"] = quarter_shp.groupby("custom_industry")[stake_metric].rank(ascending=False, method="dense")
@@ -555,4 +735,4 @@ with tab_shp:
 
             st.dataframe(top_stake[avail_shp_cols].style.format(active_shp_fmt), use_container_width=True)
         else:
-            st.warning("Stake change delta columns not found in shareholding dataset.")
+            st.warning("Stake change delta columns (FIIs_delta, DIIs_delta, Promoters_delta) not found in shareholding dataset.")
