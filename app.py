@@ -491,3 +491,268 @@ with tab_backtest:
                 log_cols = [
                     "Signal Date", "symbol", "custom_industry", "close", "turnover_cr",
                     "rvol", "sustained_vol_ratio", "fwd_5d", "fwd_10d", "fwd_20d", "peak_gain_20d"
+                ]
+                avail_log_cols = [c for c in log_cols if c in triggers.columns]
+
+                st.dataframe(
+                    triggers[avail_log_cols]
+                    .rename(columns={
+                        "symbol": "Symbol",
+                        "custom_industry": "Industry",
+                        "close": "Entry Price",
+                        "turnover_cr": "Turnover (₹ Cr)",
+                        "rvol": "1D RVOL",
+                        "sustained_vol_ratio": "3D Accum",
+                        "fwd_5d": "+5D Ret",
+                        "fwd_10d": "+10D Ret",
+                        "fwd_20d": "+20D Ret",
+                        "peak_gain_20d": "Max 20D Peak",
+                    })
+                    .style.format({
+                        "Entry Price": "₹{:.2f}",
+                        "Turnover (₹ Cr)": "₹{:.1f} Cr",
+                        "1D RVOL": "{:.2f}x",
+                        "3D Accum": "{:.2f}x",
+                        "+5D Ret": "{:+.2f}%",
+                        "+10D Ret": "{:+.2f}%",
+                        "+20D Ret": "{:+.2f}%",
+                        "Max 20D Peak": "{:+.2f}%",
+                    }, na_rep="Open"),
+                    use_container_width=True
+                )
+
+    # ================= STRATEGY B: SECTOR MOMENTUM (3-4D) =================
+    else:
+        st.caption("Evaluate how sectors performed after meeting positive 3-4 day return and 2-month volume surge conditions.")
+
+        col_b1, col_b2, col_b3, col_b4 = st.columns(4)
+        with col_b1:
+            bt_from = st.date_input("From Date", value=min_available_date, min_value=min_available_date, max_value=max_available_date, key="sec_bt_from")
+        with col_b2:
+            bt_till = st.date_input("Till Date", value=max_available_date, min_value=min_available_date, max_value=max_available_date, key="sec_bt_till")
+        with col_b3:
+            bt_lookback = st.radio("Lookback Days", [3, 4], horizontal=True, key="bt_lookback", format_func=lambda x: f"{x} Days")
+        with col_b4:
+            bt_surge_min = st.slider("Min 2M Surge Ratio", min_value=1.0, max_value=3.0, value=1.2, step=0.1, key="bt_surge")
+
+        col_b5, col_b6 = st.columns(2)
+        with col_b5:
+            bt_group = st.radio(
+                "Classification Level", ["custom_sector", "custom_industry"], horizontal=True, key="bt_group",
+                format_func=lambda x: "Sector" if x == "custom_sector" else "Industry"
+            )
+        with col_b6:
+            bt_fwd_horizon = st.selectbox(
+                "Benchmark Forward Horizon", ["fwd_return_5d", "fwd_return_10d", "fwd_return_20d"],
+                key="sec_bt_fwd",
+                format_func=lambda x: {"fwd_return_5d": "+5 Days", "fwd_return_10d": "+10 Days", "fwd_return_20d": "+20 Days (1 Month)"}[x]
+            )
+
+        if bt_from > bt_till:
+            st.error("Error: 'From Date' must be earlier than 'Till Date'.")
+        elif bt_group not in day_df.columns:
+            st.warning(f"Column '{bt_group}' not found in dataset.")
+        else:
+            ret_target_col = f"return_{bt_lookback}d"
+            sec_hist = (
+                day_df.groupby(["trade_date", bt_group], observed=True)
+                .agg(
+                    turnover_cr=("turnover_cr", "sum"),
+                    sector_return_1d=("return_1d", "mean"),
+                    lookback_ret=(ret_target_col, "mean")
+                )
+                .reset_index()
+                .sort_values([bt_group, "trade_date"])
+            )
+
+            sec_hist["turnover_2m_sma"] = (
+                sec_hist.groupby(bt_group, observed=True)["turnover_cr"]
+                .transform(lambda s: s.shift(1).rolling(42, min_periods=5).mean())
+            )
+            sec_hist["surge_2m_mult"] = (sec_hist["turnover_cr"] / sec_hist["turnover_2m_sma"].replace(0, np.nan)).round(2)
+
+            # Vectorized log-return compounding
+            sec_hist["log_ret"] = np.log1p((sec_hist["sector_return_1d"].fillna(0.0) / 100.0).clip(lower=-0.99))
+            grp_sec = sec_hist.groupby(bt_group, observed=True)["log_ret"]
+
+            sec_hist["fwd_return_5d"] = np.expm1(grp_sec.transform(lambda s: s.shift(-5).rolling(5, min_periods=5).sum())) * 100.0
+            sec_hist["fwd_return_10d"] = np.expm1(grp_sec.transform(lambda s: s.shift(-10).rolling(10, min_periods=10).sum())) * 100.0
+            sec_hist["fwd_return_20d"] = np.expm1(grp_sec.transform(lambda s: s.shift(-20).rolling(20, min_periods=20).sum())) * 100.0
+
+            trade_dates_sec = sec_hist["trade_date"].dt.date
+            in_range_mask = (trade_dates_sec >= bt_from) & (trade_dates_sec <= bt_till)
+            trigger_mask = in_range_mask & (sec_hist["lookback_ret"] > 0) & (sec_hist["surge_2m_mult"] >= bt_surge_min)
+            signals_df = sec_hist[trigger_mask].copy().sort_values("trade_date", ascending=False)
+
+            if signals_df.empty:
+                st.info("No sectors met both positive return and 2-month volume surge conditions during this date window.")
+            else:
+                valid_fwd = signals_df.dropna(subset=[bt_fwd_horizon])
+                total_signals = len(signals_df)
+                matured_signals = len(valid_fwd)
+
+                if matured_signals > 0:
+                    win_count = int((valid_fwd[bt_fwd_horizon] > 0).sum())
+                    win_rate = (win_count / matured_signals) * 100.0
+                    avg_fwd_ret = float(valid_fwd[bt_fwd_horizon].mean())
+                    best_ret = float(valid_fwd[bt_fwd_horizon].max())
+                else:
+                    win_count, win_rate, avg_fwd_ret, best_ret = 0, 0.0, 0.0, 0.0
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Signals Triggered", f"{total_signals}")
+                m2.metric(f"Win Rate ({bt_fwd_horizon.replace('fwd_return_', '+').upper()})", f"{win_rate:.1f}%", f"{win_count}/{matured_signals} wins" if matured_signals > 0 else "N/A")
+                m3.metric("Avg Forward Return", f"{avg_fwd_ret:+.2f}%")
+                m4.metric("Best Forward Return", f"{best_ret:+.2f}%")
+
+                signals_df["trigger_date"] = signals_df["trade_date"].dt.strftime("%Y-%m-%d")
+                display_cols = [
+                    "trigger_date", bt_group, "lookback_ret", "turnover_cr",
+                    "surge_2m_mult", "fwd_return_5d", "fwd_return_10d", "fwd_return_20d"
+                ]
+
+                st.dataframe(
+                    signals_df[display_cols]
+                    .rename(columns={
+                        "trigger_date": "Signal Date",
+                        bt_group: "Sector / Industry",
+                        "lookback_ret": f"{bt_lookback}D Trailing Ret",
+                        "turnover_cr": "Turnover (₹ Cr)",
+                        "surge_2m_mult": "2M Surge Multiple",
+                        "fwd_return_5d": "Next +5D Ret",
+                        "fwd_return_10d": "Next +10D Ret",
+                        "fwd_return_20d": "Next +20D Ret"
+                    })
+                    .style.format({
+                        f"{bt_lookback}D Trailing Ret": "{:+.2f}%",
+                        "Turnover (₹ Cr)": "₹{:.1f} Cr",
+                        "2M Surge Multiple": "{:.2f}x",
+                        "Next +5D Ret": "{:+.2f}%",
+                        "Next +10D Ret": "{:+.2f}%",
+                        "Next +20D Ret": "{:+.2f}%"
+                    }, na_rep="Ongoing"),
+                    use_container_width=True
+                )
+
+# ----------------- TAB 3: RETURNS -----------------
+with tab_returns:
+    col_m1, col_m2, col_m3 = st.columns(3)
+    col_m1.metric("Daily Avg Return", f"{target_df['return_1d'].mean():.2f}%")
+    col_m2.metric("Weekly Avg Return", f"{target_df['return_1w'].mean():.2f}%")
+    col_m3.metric("Monthly Avg Return", f"{target_df['return_1m'].mean():.2f}%")
+
+    st.markdown(f"#### Top 3 Gainers by Industry ({date_str})")
+    timeframe = st.radio(
+        "Select Return Horizon",
+        ["return_1d", "return_3d", "return_4d", "return_1w", "return_1m"],
+        horizontal=True,
+        format_func=lambda x: {
+            "return_1d": "1 Day", "return_3d": "3 Days", "return_4d": "4 Days",
+            "return_1w": "1 Week (5D)", "return_1m": "1 Month (21D)"
+        }.get(x, x)
+    )
+
+    if "custom_industry" in latest_stocks.columns:
+        latest_stocks["rank"] = latest_stocks.groupby("custom_industry", observed=True)[timeframe].rank(ascending=False, method="dense")
+        top_3 = latest_stocks[latest_stocks["rank"] <= 3].sort_values(["custom_industry", "rank"]).copy()
+
+        desired_cols = ["custom_industry", "rank", "symbol", "company_name", "close", timeframe]
+        avail_cols = [c for c in desired_cols if c in top_3.columns]
+
+        fmt_dict = {}
+        if "close" in avail_cols:
+            fmt_dict["close"] = "₹{:.2f}"
+        if timeframe in avail_cols:
+            fmt_dict[timeframe] = "{:+.2f}%"
+
+        st.dataframe(top_3[avail_cols].style.format(fmt_dict), use_container_width=True)
+
+# ----------------- TAB 4: VOLUME SPIKES -----------------
+with tab_vol:
+    st.markdown(f"### ⚡ Daily Volume Spikes & Unusual Activity ({date_str})")
+
+    col_v1, col_v2 = st.columns([1, 2])
+    with col_v1:
+        min_rvol = st.slider("Minimum Relative Volume (RVOL)", min_value=1.5, max_value=10.0, value=2.0, step=0.5)
+        min_turnover = st.number_input("Min Turnover (₹ Cr)", min_value=0.0, value=1.0, step=0.5)
+
+    spike_stocks = latest_stocks[(latest_stocks["rvol"] >= min_rvol) & (latest_stocks["turnover_cr"] >= min_turnover)].copy()
+
+    if not spike_stocks.empty:
+        spike_stocks = spike_stocks.sort_values(["rvol"], ascending=False)
+        cols_stock_view = ["custom_industry", "symbol", "company_name", "close", "return_1d", "volume", "vol_sma_20", "rvol", "turnover_cr"]
+        avail_stock_cols = [c for c in cols_stock_view if c in spike_stocks.columns]
+
+        st.dataframe(
+            spike_stocks[avail_stock_cols]
+            .rename(columns={
+                "return_1d": "1D Return",
+                "vol_sma_20": "20D Avg Volume",
+                "rvol": "RVOL Multiple",
+                "turnover_cr": "Turnover (₹ Cr)"
+            })
+            .style.format({
+                "close": "₹{:.2f}",
+                "1D Return": "{:+.2f}%",
+                "volume": "{:,.0f}",
+                "20D Avg Volume": "{:,.0f}",
+                "RVOL Multiple": "{:.2f}x",
+                "Turnover (₹ Cr)": "₹{:.2f} Cr"
+            }),
+            use_container_width=True
+        )
+    else:
+        st.info(f"No stocks found with RVOL ≥ {min_rvol}x and Turnover ≥ ₹{min_turnover} Cr today.")
+
+# ----------------- TAB 5: SHAREHOLDING -----------------
+with tab_shp:
+    st.markdown("### Institutional Stake Changes (QoQ)")
+
+    if shp_df.empty or "quarter_dt" not in shp_df.columns:
+        st.info("Quarterly shareholding dataset is currently empty or updating.")
+    else:
+        latest_quarter = shp_df["quarter_dt"].max()
+        quarter_str = latest_quarter.strftime("%b %Y") if pd.notna(latest_quarter) else "Latest"
+        st.caption(f"Showing filings for quarter: **{quarter_str}**")
+
+        quarter_shp = shp_df[shp_df["quarter_dt"] == latest_quarter].copy()
+
+        if MASTER_PATH.exists():
+            master_raw = pd.read_csv(MASTER_PATH, dtype=str)
+            target_meta_cols = [c for c in ["isin", "custom_sector", "custom_industry", "symbol"] if c in master_raw.columns]
+            master_meta = master_raw[target_meta_cols].drop_duplicates("isin")
+        else:
+            avail_meta_cols = [c for c in ["isin", "custom_sector", "custom_industry", "symbol"] if c in day_df.columns]
+            master_meta = day_df[avail_meta_cols].drop_duplicates("isin")
+
+        for overlap_col in ["custom_sector", "custom_industry", "symbol"]:
+            if overlap_col in quarter_shp.columns and overlap_col in master_meta.columns:
+                quarter_shp = quarter_shp.drop(columns=[overlap_col])
+
+        quarter_shp = quarter_shp.merge(master_meta, on="isin", how="inner")
+
+        if selected_sector != "All" and "custom_sector" in quarter_shp.columns:
+            quarter_shp = quarter_shp[quarter_shp["custom_sector"] == selected_sector]
+        if selected_industry != "All" and "custom_industry" in quarter_shp.columns:
+            quarter_shp = quarter_shp[quarter_shp["custom_industry"] == selected_industry]
+
+        avail_metrics = [m for m in ["FIIs_delta", "DIIs_delta", "Promoters_delta"] if m in quarter_shp.columns]
+
+        if avail_metrics and "custom_industry" in quarter_shp.columns:
+            stake_metric = st.selectbox("Rank By Stake Change", avail_metrics)
+            quarter_shp["stake_rank"] = quarter_shp.groupby("custom_industry", observed=True)[stake_metric].rank(ascending=False, method="dense")
+            top_stake = quarter_shp[quarter_shp["stake_rank"] <= 3].sort_values(["custom_industry", "stake_rank"]).copy()
+
+            shp_cols = ["custom_industry", "stake_rank", "symbol", "FIIs", "FIIs_delta", "DIIs", "DIIs_delta", "Promoters", "Promoters_delta"]
+            avail_shp_cols = [c for c in shp_cols if c in top_stake.columns]
+
+            shp_fmt = {
+                "FIIs": "{:.2f}%", "FIIs_delta": "{:+.2f}%",
+                "DIIs": "{:.2f}%", "DIIs_delta": "{:+.2f}%",
+                "Promoters": "{:.2f}%", "Promoters_delta": "{:+.2f}%"
+            }
+            active_shp_fmt = {k: v for k, v in shp_fmt.items() if k in avail_shp_cols}
+
+            st.dataframe(top_stake[avail_shp_cols].style.format(active_shp_fmt), use_container_width=True)
+        else:
+            st.warning("Stake change delta columns (FIIs_delta, DIIs_delta, Promoters_delta) not found in shareholding dataset.")
